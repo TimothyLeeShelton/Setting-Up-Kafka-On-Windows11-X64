@@ -1,53 +1,71 @@
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import from_json, col
-from pyspark.sql.types import StructType, StructField, StringType, IntegerType
+import json
+from kafka import KafkaConsumer
+import psycopg2
+from psycopg2 import sql
+from dotenv import load_dotenv
+import os
+from datetime import datetime, timedelta
 
-# Create Spark session
-spark = SparkSession.builder \
-    .appName("WikipediaChangesConsumer") \
-    .config("spark.jars.packages", "org.apache.spark:spark-sql-kafka-0-10_2.12:3.1.2") \
-    .getOrCreate()
+# Load environment variables
+load_dotenv()
 
-# Define the schema for the incoming JSON data
-schema = StructType([
-    StructField("title", StringType(), True),
-    StructField("type", StringType(), True),
-    StructField("user", StringType(), True),
-    StructField("bot", StringType(), True),
-    StructField("id", StringType(), True),
-    StructField("timestamp", StringType(), True)
-])
+# Kafka Consumer configuration
+consumer = KafkaConsumer(
+    'wikipedia_edits',
+    bootstrap_servers=[os.getenv('KAFKA_BOOTSTRAP_SERVERS', 'localhost:9092')],
+    auto_offset_reset='earliest',
+    enable_auto_commit=True,
+    group_id='wikipedia_processor',
+    value_deserializer=lambda x: json.loads(x.decode('utf-8'))
+)
 
-# Read from Kafka
-df = spark \
-    .readStream \
-    .format("kafka") \
-    .option("kafka.bootstrap.servers", "localhost:9092") \
-    .option("subscribe", "wikipedia_changes") \
-    .load()
+# PostgreSQL connection
+conn = psycopg2.connect(
+    dbname=os.getenv('DB_NAME'),
+    user=os.getenv('DB_USER'),
+    password=os.getenv('DB_PASSWORD'),
+    host=os.getenv('DB_HOST'),
+    port=os.getenv('DB_PORT')
+)
+cur = conn.cursor()
 
-# Parse the JSON data
-parsed_df = df.select(from_json(col("value").cast("string"), schema).alias("data")).select("data.*")
+# Drop the existing table if it exists
+cur.execute("DROP TABLE IF EXISTS page_changes")
+conn.commit()
 
-# Process the data (count changes per page)
-result_df = parsed_df.groupBy("title").count().orderBy(col("count").desc())
+# Create the page_changes table with a proper constraint
+cur.execute("""
+    CREATE TABLE page_changes (
+        window_start TIMESTAMP,
+        window_end TIMESTAMP,
+        title TEXT,
+        count_of_changes INTEGER,
+        CONSTRAINT page_changes_pkey PRIMARY KEY (window_start, window_end, title)
+    )
+""")
+conn.commit()
 
-# Write to PostgreSQL
-def write_to_postgres(df, epoch_id):
-    df.write \
-        .format("jdbc") \
-        .option("url", "jdbc:postgresql://localhost:5432/wikipedia_changes") \
-        .option("dbtable", "page_changes") \
-        .option("user", "your_username") \
-        .option("password", "your_password") \
-        .mode("append") \
-        .save()
+# Process messages
+window_duration = timedelta(minutes=1)  # Adjust as needed
+for message in consumer:
+    change = message.value
+    title = change.get('title', 'Unknown')
+    current_time = datetime.now()
+    window_start = current_time.replace(second=0, microsecond=0)
+    window_end = window_start + window_duration
+    
+    # Update the count in the database
+    cur.execute("""
+        INSERT INTO page_changes (window_start, window_end, title, count_of_changes)
+        VALUES (%s, %s, %s, 1)
+        ON CONFLICT (window_start, window_end, title)
+        DO UPDATE SET count_of_changes = page_changes.count_of_changes + 1
+    """, (window_start, window_end, title))
+    conn.commit()
+    
+    print(f"Processed change for page: {title} in window {window_start} to {window_end}")
 
-# Start the streaming query
-query = result_df \
-    .writeStream \
-    .outputMode("complete") \
-    .foreachBatch(write_to_postgres) \
-    .start()
-
-query.awaitTermination()
+# Close connections
+cur.close()
+conn.close()
+consumer.close()
